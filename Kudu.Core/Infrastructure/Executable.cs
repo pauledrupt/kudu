@@ -67,57 +67,25 @@ namespace Kudu.Core.Infrastructure
 
         public Tuple<string, string> Execute(ITracer tracer, string arguments, params object[] args)
         {
-            using (GetProcessStep(tracer, arguments, args))
+            using (MemoryStream outputStream = new MemoryStream(),
+                                errorStream = new MemoryStream())
             {
-                var process = CreateProcess(arguments, args);
-                process.Start();
+                Execute(tracer, input: null, output: outputStream, error: errorStream, arguments: arguments, args: args);
 
-                var idleManager = new Kudu.Core.Infrastructure.IdleManager(IdleTimeout, tracer);
-                Func<StreamReader, Task<string>> reader = async (StreamReader streamReader) =>
-                {
-                    var strb = new StringBuilder();
-                    char[] buffer = new char[1024];
-                    int read;
-                    while ((read = await streamReader.ReadBlockAsync(buffer, 0, buffer.Length)) != 0)
-                    {
-                        idleManager.UpdateActivity();
-                        strb.Append(buffer, 0, read);
-                    }
-                    idleManager.UpdateActivity();
-                    return strb.ToString();
-                };
-
-                Task<string> outputReaderTask = Task.Run(async () => await reader(process.StandardOutput));
-                Task<string> errorReaderTask = Task.Run(async () => await reader(process.StandardError));
-
-                process.StandardInput.Close();
-
-                idleManager.WaitForExit(process);
-
-                string output = outputReaderTask.Result;
-                string error = errorReaderTask.Result;
-
-                tracer.TraceProcessExitCode(process);
-
-                // Sometimes, we get an exit code of 1 even when the command succeeds (e.g. with 'git reset .').
-                // So also make sure there is an error string
-                if (process.ExitCode != 0)
-                {
-                    string text = String.IsNullOrEmpty(error) ? output : error;
-
-                    throw new CommandLineException(Path, process.StartInfo.Arguments, text)
-                    {
-                        ExitCode = process.ExitCode,
-                        Output = output,
-                        Error = error
-                    };
-                }
-
-                return Tuple.Create(output, error);
+                return Tuple.Create(ReadAsString(outputStream),
+                                    ReadAsString(errorStream));
             }
         }
 
         public void Execute(ITracer tracer, Stream input, Stream output, string arguments, params object[] args)
+        {
+            using (var errorStream = new MemoryStream())
+            {
+                Execute(tracer, input: input, output: output, error: errorStream, arguments: arguments, args: args);
+            }
+        }
+
+        private void Execute(ITracer tracer, Stream input, Stream output, MemoryStream error, string arguments, params object[] args)
         {
             using (GetProcessStep(tracer, arguments, args))
             {
@@ -125,86 +93,74 @@ namespace Kudu.Core.Infrastructure
                 process.Start();
 
                 var idleManager = new IdleManager(IdleTimeout, tracer, output);
-                Func<StreamReader, string> reader = (StreamReader streamReader) => streamReader.ReadToEnd();
-                Action<Stream, Stream, bool> copyStream = (Stream from, Stream to, bool closeAfterCopy) =>
-                {
-                    try
-                    {
-                        byte[] bytes = new byte[1024];
-                        int read = 0;
-                        bool writeError = false;
-                        while ((read = from.Read(bytes, 0, bytes.Length)) != 0)
-                        {
-                            idleManager.UpdateActivity();
-                            try
-                            {
-                                if (!writeError)
-                                {
-                                    to.Write(bytes, 0, read);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                writeError = true;
-                                tracer.TraceError(ex);
-                            }
-                        }
-
-                        idleManager.UpdateActivity();
-                        if (closeAfterCopy)
-                        {
-                            to.Close();
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        tracer.TraceError(ex);
-                    }
-                };
-
-                IAsyncResult errorReader = reader.BeginInvoke(process.StandardError, null, null);
-                IAsyncResult inputResult = null;
-
+                
+                var tasks = new List<Task>();
                 if (input != null)
                 {
                     // Copy into the input stream, and close it to tell the exe it can process it
-                    inputResult = copyStream.BeginInvoke(input,
-                                                         process.StandardInput.BaseStream,
-                                                         true,
-                                                         null,
-                                                         null);
+                    tasks.Add(Task.Run(async() =>
+                        await CopyStream(tracer, idleManager, input, process.StandardInput.BaseStream, closeAfterCopy: true)));
                 }
 
                 // Copy the exe's output into the output stream
-                IAsyncResult outputResult = copyStream.BeginInvoke(process.StandardOutput.BaseStream,
-                                                                   output,
-                                                                   false,
-                                                                   null,
-                                                                   null);
+                tasks.Add(Task.Run(async () =>
+                    await CopyStream(tracer, idleManager, process.StandardOutput.BaseStream, output, closeAfterCopy: false)));
+
+                tasks.Add(Task.Run(async() => 
+                    await CopyStream(tracer, idleManager, process.StandardError.BaseStream, error, closeAfterCopy: false)));
 
                 idleManager.WaitForExit(process);
 
-                // Wait for the input operation to complete
-                if (inputResult != null)
-                {
-                    inputResult.AsyncWaitHandle.WaitOne();
-                }
-
                 // Wait for the output operation to be complete
-                outputResult.AsyncWaitHandle.WaitOne();
-
-                string error = reader.EndInvoke(errorReader);
-
+                Task.WaitAll(tasks.ToArray());
+                
                 tracer.TraceProcessExitCode(process);
 
                 if (process.ExitCode != 0)
                 {
-                    throw new CommandLineException(Path, process.StartInfo.Arguments, error)
+                    var errorString = ReadAsString(error);
+                    throw new CommandLineException(Path, process.StartInfo.Arguments, errorString)
                     {
                         ExitCode = process.ExitCode,
-                        Error = error
+                        Error = errorString
                     };
                 }
+            }
+        }
+
+        private static async Task CopyStream(ITracer tracer, IdleManager idleManager, Stream from, Stream to, bool closeAfterCopy)
+        {
+            try
+            {
+                byte[] bytes = new byte[1024];
+                int read = 0;
+                bool writeError = false;
+                while ((read = await from.ReadAsync(bytes, 0, bytes.Length)) != 0)
+                {
+                    idleManager.UpdateActivity();
+                    try
+                    {
+                        if (!writeError)
+                        {
+                            await to.WriteAsync(bytes, 0, read);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        writeError = true;
+                        tracer.TraceError(ex);
+                    }
+                }
+
+                idleManager.UpdateActivity();
+                if (closeAfterCopy)
+                {
+                    to.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                tracer.TraceError(ex);
             }
         }
 
@@ -370,6 +326,11 @@ namespace Kudu.Core.Infrastructure
             };
 
             return process;
+        }
+
+        private static string ReadAsString(MemoryStream stream)
+        {
+            return Encoding.UTF8.GetString(stream.ToArray());
         }
     }
 }
