@@ -2,7 +2,7 @@
 {
     public interface IAnalytics
     {
-        void ProjectDeployed(string projectType, string result, string error, long deploymentDurationInMilliseconds);
+        void ProjectDeployed(string projectType, string result, string error, long deploymentDurationInMilliseconds, string siteMode);
         void JobStarted(string jobName, string scriptExtension, string jobType);
     }
 }
